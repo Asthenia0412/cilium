@@ -14,6 +14,7 @@ import (
 
 	"github.com/cilium/hive/cell"
 
+	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
@@ -387,20 +388,22 @@ func (c *controller) runController() {
 				c.recordError(err, params.Health)
 
 				if !params.NoErrorRetry {
-					if params.ErrorRetryBaseDuration != time.Duration(0) {
-						interval = time.Duration(errorRetries) * params.ErrorRetryBaseDuration
-					} else {
-						interval = time.Duration(errorRetries) * time.Second
+					base := params.ErrorRetryBaseDuration
+					if base == time.Duration(0) {
+						base = time.Second
 					}
 
-					if params.MaxRetryInterval > 0 && interval > params.MaxRetryInterval {
-						c.logger.Debug(
-							"Cap retry interval to max allowed value",
-							logfields.CalculatedInterval, interval,
-							logfields.MaxAllowedInterval, params.MaxRetryInterval,
-						)
-						interval = params.MaxRetryInterval
-					}
+					// Use exponential backoff instead of linear so that
+					// persistent failures back off faster, reducing load
+					// on dependent systems and avoiding thundering-herd
+					// behaviour when many controllers fail at once.
+					//
+					// errorRetries starts at 1; pass (errorRetries-1) so
+					// the first two failures produce the same intervals as
+					// before (base, 2*base), preserving short-term retry
+					// latency for transient errors while switching to
+					// exponential growth from the third failure onward.
+					interval = backoff.CalculateDuration(base, params.MaxRetryInterval, 2.0, false, errorRetries-1)
 
 					errorRetries++
 				}
